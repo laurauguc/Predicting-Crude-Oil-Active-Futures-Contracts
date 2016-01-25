@@ -1,0 +1,544 @@
+---
+title: "Predicting Returns on Crude Oil Front Month Futures Contracts"
+author: "Laura Uguccioni"
+date: "December 3, 2015"
+output: html_document
+---
+
+# Objective
+
+The objective of this project is to predicts the price and returns of crude oil front month futures contracts. To this end, I select a cost function, build multiple models to identify parameters, use the models to makes predictions in the testing data, and then I use the cost function to rank the models.
+
+Structure of report:
+
+1. Selection of a cost function
+
+2. Overview of the data
+
+3. Preliminary visualizations
+
+4. Preliminary models
+
+5. Predictions in the testing data
+
+6. Ranking models / selection of best model
+
+5. Final visualizations
+
+# Cost Function
+
+Assumptions used to identify a cost function:
+
+* Traders are risk-adverse: the larger the misprediction, the greater the cost.
+
+* Traders can take both short or long positions. Therefore, the cost function should penalize mispredicted positive or negative price changes equally.
+
+Given the above assumptions, the criteria for the cost function is that it should be exponential and symmetric. For this reason, I select the standard average of Squared Errors as the cost function.
+
+# The Data
+
+I have collected the data from two sources:
+
+* The Energy Information Administration website. I have merged and organized this data in a seperate Rmd file. I called this dataset 'Fundamentals' and I have loaded it below.
+
+* The Wharton Research Data Services (WRDS) data. I accessed this data from the WRDS cloud via a remote R connection. After merging and cleaning this data in a seperate Rmd file, I have called it 'Econ Ind' and I have loaded it below.
+
+After loading the data, I merged the data and made further adjustments. One adjustement of relevance relates to the treatment of 'NA's. While the price data is available on a daily basis, other variables were available on a weekly, monthly, or yearly basis only. In this case, I filled the 'NA' observations with the average value for the time period. It is worth noting that a better approach would have been to estimate the missing data points using available data and seasonality patterns.
+
+I use data from 2003-12-01 to 2015-11-17 for the analysis, but show some preliminary plots of earlier data from 1983.
+
+```{r echo = FALSE}
+load("~/Documents/QMSS Term 1/Projects/Crude Oil Prices/Data/EconInd.Rda")
+load("~/Documents/QMSS Term 1/Projects/Crude Oil Prices/Data/Fundamentals.Rda")
+
+EconInd$date <- as.Date(EconInd$date)
+library(plyr)
+Fundamentals <- rename(Fundamentals, c("Date" = "date"))
+df <- merge(Fundamentals, EconInd, by = "date", all = TRUE)
+rm(EconInd, Fundamentals)
+
+library(zoo) # I fill forward because I had set the value at the beginning of the time period
+df$consumption <- na.locf(df$consumption, na.rm = FALSE) 
+df$indstr_prod <- na.locf(df$indstr_prod, na.rm = FALSE)
+df$cpi <- na.locf(df$cpi, na.rm = FALSE)
+df$unempl <- na.locf(df$unempl, na.rm = FALSE)
+df$reserves_fed <- na.locf(df$reserves_fed, na.rm = FALSE)
+df$ppi <- na.locf(df$ppi, na.rm = FALSE)
+df$indstr_prod2 <- na.locf(df$indstr_prod2, na.rm = FALSE)
+df$cad_usd_exch_bid <- na.locf(df$cad_usd_exch_bid, na.rm = FALSE)
+df$cad_usd_exch_ask <- na.locf(df$cad_usd_exch_ask , na.rm = FALSE)
+df <- df[!is.na(df$Price),]
+```
+
+## The Dependent Variable
+
+My dependent variable is daily return on the price of crude oil fronth month active contracts traded in New York Mercantile Exchange (NYMEX). I will also show predictions and visualizations of the price of the contract, though my central aim is to predict the returns.
+
+The data available from EIA website on the price of active crude oil contracts only shows one price per day. Therefore, the returns that I calculate are __inter__ -day returns. It would have been better to obtain opening and closing prices and calculate __intra__ -day returns, but this data was not available on the EIA website. (Note however: the data is available on Columbia's Bloomber terminals).
+
+Note: Futures contracts prices reflect expectations of the price of the underlying product (in this case, crude oil) at a future point in time (delivery date). Multiple contracts for different future time periods trade at the same time. Typically, the contract that is closer to expiry (called 'front month') exhibits the highest trading volume.
+
+Here I calculate prior day price and the interday return:
+```{r}
+df$n <- 1:nrow(df)
+df$previous_price <- df$Price[ifelse(df$n==1,df$n, df$n-1)]
+df$return <- (df$Price - df$previous_price)/ df$previous_price *100
+df <- df[ , -17]
+df <- df[, c(18,2,1,3:17)]
+```
+
+## The Independent Variables
+
+The variables obtained from the above sources are described below. I also contruct additional variables.
+
+### Description of Variables
+
+#### Obtained from the EIA
+
+__comm_stocks__
+Weekly U.S. Ending Stocks excluding SPR of Crude Oil (Thousand Barrels). Frequency of data: weekly.
+Source: EIA.
+
+__cost__
+U.S. Nominal Cost per Foot of Crude Oil Wells Drilled (Dollars per Foot). Frequency of data: annual.
+
+__reserves__
+U.S. Crude Oil Proved Reserves (Million Barrels). Frequency of data: annual.
+
+__spr__
+U.S. Ending Stocks of Crude Oil in Strategic Petroleum Reserves (SPR) (Thousand Barrels). Frequency of data: weekly.
+
+__us_production__
+U.S. Field Production of Crude Oil (Thousand Barrels per Day). Frequency of data: monthly.
+
+#### Obtained from WRDS
+
+__consumption__
+Consumption of Oil in the United States ('000 barrers per day), EIA
+
+__indstr_prod__
+Industrial Production, Preliminary Series, SA.
+
+__cpi__
+Consumer price index - percent change year ago period, NSA
+
+__unempl__
+Unemployment rate (%), SA
+
+__fed.reserves__
+Total reserves (mil us$) - end of period
+
+__ppi__
+Producer Price Index: Depository Credit Intermediation, NSA
+
+__indstr.prod2__
+Industrial Production Index, SA
+
+__cad.usd.exch.bid__
+Exchange rate (IDC) - London market close - Forward - BID - 30 day - CDN$/USD
+
+__cad.usd.exch.ask__
+Exchange rate (IDC) - London market close - Forward - ASK - 30 day - CDN$/USD
+
+### Constructed Variables
+
+I construct the following variables:
+
+1) Days until contract expiry.
+
+2) A Fourier series to model seasonality.
+
+__Days until contract expiry__
+
+I use the below definition of Contract 1 (a.k.a front month) to calculate the expiry date:
+
+_Contract Definition:	A futures contract specifying the earliest delivery date. For crude oil, each contract expires on the third business day prior to the 25th calendar day of the month preceding the delivery month. If the 25th calendar day of the month is a non-business day, trading ceases on the third business day prior to the business day preceding the 25th calendar day. After a contract expires, Contract 1 for the remainder of that calendar month is the second following month._
+
+Day on the 25th | 3 business days before | Difference
+--------------  | ---------------------- | ----------
+Sunday | Tuesday | 5 days
+Saturday | Tuesday | 4 days
+Friday | Tuesday | 3 days
+Thursday | Monday | 3 days
+Wednesday | Friday | 5 days
+Tuesday | Thursday | 5 days
+Monday | Wednesday | 5 days
+
+Identify expiry date
+```{r}
+date <- df$date
+df2 <- data.frame(date)
+df2$month <- as.numeric(format(df2$date, "%m"))
+df2$year <- as.numeric(format(df2$date, "%Y"))
+df2$day <- as.numeric(format(df2$date, "%d"))
+df2$new_date <- as.Date(paste0(df2$year,"-",df2$month,"-25"))
+df2$weekday <- as.numeric(format(df2$new_date, "%w"))
+df2$days_to_subtr <- ifelse(df2$weekday <= 3, 5, ifelse(df2$weekday == 6, 4, 3)) # Note: Sunday corresponds to weekday 0.
+df2$expiry1 <- df2$new_date - df2$days_to_subtr
+
+# Check weekday of expiry day (should only be within 1 and 5)
+summary(as.numeric(format(df2$expiry1, "%w")))
+
+# Expiry 2
+df2$new_date2 <- as.Date(paste0(df2$year,"-",df2$month + 1,"-25"))
+df2$weekday2 <- as.numeric(format(df2$new_date2, "%w"))
+df2$days_to_subtr2 <- ifelse(df2$weekday2 <= 3, 5, ifelse(df2$weekday2 == 6, 4, 3)) # Note: Sunday corresponds to weekday 0.
+df2$expiry2 <- df2$new_date2 - df2$days_to_subtr2
+summary(as.numeric(format(df2$expiry2, "%w")))
+
+# Selecting correct expiry day
+df2$comparison_day <- as.numeric(format(df2$expiry1, "%d"))
+df2$expiration_date <- as.Date(ifelse(df2$day > df2$comparison_day, df2$expiry2, df2$expiry1))
+
+df2$days_until_expiry <- as.numeric(df2$expiration_date-df2$date)
+df$expiry_date <- df2$expiration_date
+df$days_util_expiry <- df2$days_until_expiry
+rm(df2)
+rm(date)
+
+df <- df[, c(1:3,19:20,4:18)]
+```
+
+__Modelling seasonality__
+
+I use a fast Fourier series to model seasonality, as follows.
+```{r}
+df$month <- as.numeric(format(df$date, "%m"))
+df$sin1 <- sin(2*pi*df$month/12)
+df$cos1 <- cos(2*pi*df$month/12) 
+df$sin2 <- sin(4*pi*df$month/12)
+df$cos2 <- cos(4*pi*df$month/12) 
+df$sin3 <- sin(6*pi*df$month/12)
+df$cos3 <- cos(6*pi*df$month/12) 
+df$sin4 <- sin(8*pi*df$month/12)
+df$cos4 <- cos(8*pi*df$month/12) 
+df$sin5 <- sin(10*pi*df$month/12)
+df$cos5 <- cos(10*pi*df$month/12) 
+```
+
+# Preliminary Visualizations
+
+Note: Due to some later conflicts between packages, I visualize a non-linear generalized additive model here (though it is more relevant later).
+```{r}
+df2 <- df[complete.cases(df),]
+training2 <- df2[df2$date < "2014-01-01",]
+testing2 <- df2[df2$date >= "2014-01-01",]
+
+library(gam)
+gam1 <- gam::gam(return ~ s(date) + s(reserves) + s(comm_stocks) + s(spr) + s(us_production) + s(cost)  + s(indstr_prod) + s(unempl) + s(cad_usd_exch_bid) + s(cpi) + s(reserves_fed) + s(ppi) + s(indstr_prod2) + s(month), data = training2)
+
+par(mfcol = c(2,2))
+plot(gam1, residuals = TRUE, pch =".", rugplot = FALSE)
+par(mfcol = c(2,1))
+```
+
+## Returns and price overtime
+
+Returns, Industrial production, and cost of drilling
+```{r}
+library(ggplot2)
+qplot(data = df, x = date, y = return, colour = cost, lwd = indstr_prod, xlab = "Time", ylab = "Crude Oil Active Future Contract ($ / Barrel)") + ggtitle("Returns, Industrial production, and cost of drilling") + geom_smooth()
+```
+
+Price, Industrial production, and cost of drilling
+```{r}
+qplot(data = df, x = date, y = Price, colour = cost, lwd = indstr_prod, xlab = "Time", ylab = "Crude Oil Active Future Contract ($ / Barrel)") + ggtitle("Price, Industrial production, and cost of drilling") + geom_smooth()
+```
+
+## Return and selected determinants
+```{r}
+chart_return <- function(x, xlab, y = df$return, ylab = "Returns"){
+  plot(y = y, x = x, xlab = xlab, ylab = ylab, pch = 1)
+  abline(lm(y ~ x), col = "blue", lwd = 1)
+}
+
+par(mfcol = c(2,2))
+
+chart_return(df$expiry_date, "Expiry Day of Contract")
+chart_return(df$days_util_expiry, "Number of days until expiry")
+chart_return(df$reserves, "U.S. Crude Oil Proved Reserves (Million Barrels)")
+chart_return(df$comm_stocks, "Ending Stocks excluding SPR of Crude Oil (Thousand Barrels)")
+chart_return(df$unempl, "Unemployment rate (%)")
+chart_return(df$cad_usd_exch_bid, "CDN$/USD exchange rate - 30 day BID")
+chart_return(df$cad_usd_exch_ask, "CDN$/USD exchange rate - 30 day ASK")
+chart_return(df$previous_price, "Previous day price")
+chart_return(df$month, "Month")
+chart_return(df$cos1, "First element of the seasonality pattern (cos1)")
+```
+
+## Price and selected determinants
+```{r}
+chart <- function(x, xlab, y = df$Price, ylab = "Price"){
+  plot(y = y, x = x, xlab = xlab, ylab = ylab, pch = 1)
+  abline(lm(y ~ x), col = "blue", lwd = 1)
+}
+
+par(mfcol = c(2,2))
+
+chart(df$expiry_date, "Expiry Date of the Contract")
+chart(df$reserves, "U.S. Crude Oil Proved Reserves (Million Barrels)")
+chart(df$us_production, "U.S. Field Production of Crude Oil (Thousand Barrels per Day)")
+chart(df$spr, "U.S. Ending Stocks of Crude Oil in Strategic Petroleum Reserves (SPR) (Thousand Barrels)")
+chart(df$comm_stocks, "Ending Stocks excluding SPR of Crude Oil (Thousand Barrels)")
+chart(df$indstr_prod, "Industrial Production, Preliminary Series")
+chart(df$cpi, "Consumer price index - percent change year ago period")
+chart(df$ppi, "Producer Price Index")
+```
+
+# Preliminary Models
+
+## Training vs. Testing Data
+
+```{r}
+df <- df[complete.cases(df),]
+training <- df[df$date < "2014-01-01",]
+testing <- df[df$date >= "2014-01-01",]
+```
+
+## Linear models
+
+### Bivariate linear regression
+```{r}
+lm0 <- lm(return ~ date, training)
+lm0b <- lm(Price ~ date, training)
+
+library(stargazer)
+stargazer(lm0, lm0b, type = 'text')
+
+p <- qplot(data = df, x = date, y = return, xlab = "Time", ylab = "Returns")
+coef_lm0 <- coef(lm0)
+p + geom_abline(intercept = coef_lm0[1], slope = coef_lm0[2], col = "green", lwd = 1)
+
+p <- qplot(data = df, x = date, y = Price, xlab = "Time", ylab = "Price ($ / Barrel)")
+coef_lm0b <- coef(lm0b)
+p + geom_abline(intercept = coef_lm0b[1], slope = coef_lm0b[2], col = "green", lwd = 1)
+```
+
+### Multivariate linear regressions
+
+#### Adding seasonality to the model
+
+```{r}
+lm1a <- lm(return ~ date + sin1 + cos1 + sin2 + cos2 + sin3 + cos3 + sin4 + cos4 + sin5 + cos5, training)
+lm1b <- lm(Price ~ date + sin1 + cos1 + sin2 + cos2 + sin3 + cos3 + sin4 + cos4 + sin5 + cos5, training)
+
+lm1a_subset <- step(lm1a, trace = FALSE)
+lm1b_subset <- step(lm1b, trace = FALSE)
+
+ggplot(data = training, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = lm1a_subset$fitted.values), color = "green")
+
+ggplot(data = training, aes(x=date))+
+geom_line(aes(y = Price)) +
+geom_line(aes(y = lm1b_subset$fitted.values), color = "green")
+```
+
+### Adding oil fundamentals and economic indicators
+```{r}
+lm2a <- lm(return ~ . + comm_stocks * cost  + reserves * us_production - previous_price - Price, training)
+lm2b <- lm(Price ~ . + comm_stocks * cost  + reserves * us_production - previous_price - return, training)
+
+# next command is needed for later
+X_test <- model.matrix(return ~ . + comm_stocks * cost  + reserves * us_production - previous_price - Price, data = testing)
+
+lm2a_subset <- step(lm2a, trace = FALSE)
+lm2b_subset <- step(lm2b, trace = FALSE)
+
+ggplot(data = training, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = lm2a_subset$fitted.values), colour = "green" )
+
+ggplot(data = training, aes(x=date))+
+geom_line(aes(y = Price)) +
+geom_line(aes(y = lm2b_subset$fitted.values), colour = "green" )
+```
+
+### Including prior-day price
+```{r}
+lm3a <- lm(return ~ . + comm_stocks * cost  + reserves * us_production - Price, training[,-28])
+lm3b <- lm(Price ~ . + comm_stocks * cost  + reserves * us_production - return, training[,-28])
+
+lm3a_subset <- step(lm3a, trace = FALSE)
+lm3b_subset <- step(lm3b, trace = FALSE)
+
+ggplot(data = training, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = lm3a_subset$fitted.values), colour = "green" )
+
+ggplot(data = training, aes(x=date))+
+geom_line(aes(y = Price)) +
+geom_line(aes(y = lm3b_subset$fitted.values), colour = "green" )
+```
+
+### Summary of models so far
+
+```{r}
+stargazer(lm1a, lm2a, lm3a_subset, type = 'text')
+stargazer(lm1b, lm2b, lm3b_subset, type = 'text')
+```
+
+## Additional linear models
+
+### Lasso
+```{r}
+library(lars)
+X <- model.matrix(lm2a)
+
+y <- training$return
+lasso <- lars(X, y, type = "lasso", trace = FALSE)
+summary(lasso)
+```
+
+### Principal component regression
+```{r}
+library(pls)
+PCR <- pcr(return ~ . - Price - previous_price , data = training, validation = "LOO")
+summary(PCR)
+```
+
+## Non-linear models
+
+### Generalized additive model
+```{r}
+detach("package:mgcv")
+
+library(gam)
+gam1 <- gam::gam(return ~ s(date) + s(reserves) + s(comm_stocks) + s(spr) + s(us_production) + s(cost)  + s(indstr_prod) + s(unempl) + s(cad_usd_exch_bid) + s(cpi) + s(reserves_fed) + s(ppi) + s(indstr_prod2) + s(month), data = training)
+
+par(mfcol = c(1,1))
+# Due to conflicts between packages, I cannot show the results to the following two commands below. Therefore I show the plots at the beginning.
+# plot(gam1, residuals = TRUE, pch =".", rugplot = FALSE)
+# summary(gam1)
+```
+
+### BART machine
+```{r}
+library(bartMachine)
+set_bart_machine_num_cores(parallel::detectCores())
+
+bart <- bartMachine(X = training[,-(1:2)], y = training$return)
+```
+
+### Boosting
+```{r}
+library(gbm)
+boosted <- gbm(return ~ . + comm_stocks * cost  + reserves * us_production - date -expiry_date, data = training, interaction.depth = 4, shrinkage = 0.001)
+```
+
+# Predictions in the Testing Data
+```{r}
+# lm0
+testing$return_lm0 <- predict(lm0, newdata = testing)
+testing$squarederror_lm0 <- with(testing, (return_lm0 - return)^2)
+(average_SE_lm0 <- mean(testing$squarederror_lm0))
+
+# lm2
+testing$return_lm2 <- predict(lm2a, newdata = testing)
+testing$squarederror_lm2 <- with(testing, (return_lm2 - return)^2)
+(average_SE_lm2 <- mean(testing$squarederror_lm2))
+
+# lm3a_subset
+testing$return_lm3_subset <- predict(lm3a_subset, newdata = testing)
+testing$squarederror_lm3_subset <- with(testing, (return_lm3_subset - return)^2)
+(average_SE_lm3_subset <- mean(testing$squarederror_lm3_subset))
+
+# lasso  
+lasso_return <- predict(lasso, newx = X_test)$fit
+average_SE_lasso <- colMeans( (testing$return - lasso_return) ^ 2 )
+(average_SE_lasso <- min(average_SE_lasso))
+
+predictions_lasso <- lasso_return[,which.min(average_SE_lasso)]
+
+# PCR
+testing$PCR_return <- predict(PCR, newdata = testing)
+average_SE_PCR <- colMeans( (testing$return - testing$PCR_return) ^ 2 )
+(average_SE_PCR <- min(average_SE_PCR))
+predictions_PCR <- testing$PCR_return[ , , which.min(average_SE_PCR)]
+
+error_PCR <- predictions_PCR - testing$return
+
+# Bart
+testing$bart_return <- predict(bart, new_data = testing[,3:31])
+testing$squarederror_bart <- with(testing, (bart_return - return)^2)
+(average_SE_bart <- mean(testing$squarederror_bart))
+
+# boosted
+testing$boosted_return <- predict(boosted, newdata = testing, type = "response", n.trees = 100)
+testing$squarederror_boost <- with(testing, (boosted_return - return)^2)
+(average_SE_boosted <- mean(testing$squarederror_boost))
+
+# gam
+testing$return_gam <- predict(gam1, newdata = testing)
+testing$squarederror_gam <- with(testing, (return_gam - return)^2)
+(average_SE_gam <- mean(testing$squarederror_gam))
+
+# compare to a guess of returns = 0 for each day.
+testing$squarederror_return0 <- with(testing, (return)^2)
+(average_SSE_return0 <- mean(testing$squarederror_return0))
+```
+
+# Ranking models and discussion
+
+According the average SE criteria (selected as the cost function in this project), the best model is the BART machine, which greatly outranks all others.
+
+Note that the BART model predicted the worst. This is because BART assumes independent obeservations and therefore it is not well suited for timeseries data with autocorrelation. Further, the dataset has also been modified so that there isn't any missing values and therefore, one of the benefits of BART - dealing with missing data - is not taken advantage of here.
+
+The full ranking is:
+
+Rank Number | Model Name | Average Squared Errors
+------------|--------------------| -------------------
+1 | Principal Components Regression | 5.49972
+2 | Bivariate regression of return on time | 5.511555
+3 | Lasso | 5.519184
+4 | Guessing a return of zero | 5.520292
+5 | Boosting | 5.520741
+6 | Multivariate Regression with all inputs except prior price | 5.530715
+7 | Subset of multivariate linear regression with all inputs (using step function) | 6.250821
+8 | General Additive Model | 6.668476
+9 | Bart Machine | $`r average_SE_bart `$
+
+# Final Visualizations
+
+## Plots of the best model (PCR)
+```{r}
+library(ggplot2)
+
+ggplot(data = testing, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = predictions_PCR), colour = "green" ) + ggtitle("Principal Component Regression in Testing Data") + ylab("Returns: actual (black) vs predicted (green)")
+
+ggplot(data = testing, aes(x = date)) + geom_line(aes(y = error_PCR)) + ggtitle("Plot of errors in Testing Data") + ylab("Error") + xlab("Time")
+```
+
+## Plots of predictions in the testing data by other models (for contrast)
+
+```{r}
+ggplot(data = testing, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = bart_return), colour = "green" ) + ggtitle("BART machine in Testing Data") + ylab("Returns: actual (black) vs predicted (green)")
+
+ggplot(data = testing, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = return_lm0), colour = "green" ) + ggtitle("Bivariate Regression in Testing Data") + ylab("Returns: actual (black) vs predicted (green)")
+
+ggplot(data = testing, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = boosted_return), colour = "green" ) + ggtitle("Boosted Model in Testing Data") + ylab("Returns: actual (black) vs predicted (green)")
+
+ggplot(data = testing, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = return_gam), colour = "green" ) + ggtitle("GAM Model in Testing Data") + ylab("Returns: actual (black) vs predicted (green)")
+
+ggplot(data = testing, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = return_lm2), colour = "green" ) + ggtitle("Multivariate Regression 1 in Testing Data") + ylab("Returns: actual (black) vs predicted (green)")
+
+ggplot(data = testing, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = return_lm3_subset), colour = "green" ) + ggtitle("Multivariate Regression 2 in Testing Data") + ylab("Returns: actual (black) vs predicted (green)")
+
+ggplot(data = testing, aes(x=date))+
+geom_line(aes(y = return)) +
+geom_line(aes(y = predictions_lasso), colour = "green" ) + ggtitle("Lasso in Testing Data") + ylab("Returns: actual (black) vs predicted (green)")
+```
