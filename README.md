@@ -1,2 +1,4 @@
 # Predicting-Crude-Oil-Active-Futures-Contracts
-Data mining
+
+I completed this project for my data mining course. The goal was to predict the returns on active crude oil futures contracts. I extracted data on oil fundamentals and on economics conditions from the Wharton Research Data Services (WRDS) cloud and from Energy Information Administration (EIA)'s website. I used various models borrowed from machine learning and statistics: multiple regression using Fourier series to model seasonality, step function, lasso, principal component regression, a generalized additive model using splines to smooth terms, BART machine (a Bayesian model), and boosting. I then ranked the models according to the predictions in the testing data that minimized the selected cost function. I found that the best model according to this criterion is the principal component regression. I discussed the implications in the paper.
+
